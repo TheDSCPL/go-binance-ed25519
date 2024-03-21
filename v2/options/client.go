@@ -3,6 +3,8 @@ package options
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
@@ -204,19 +206,26 @@ func getApiEndpoint() string {
 // NewClient initialize an API client instance with API key and secret key.
 // You should always call this function before using this SDK.
 // Services will be created by the form client.NewXXXService().
-func NewClient(apiKey, secretKey string) *Client {
+func NewClient(apiKey, secretKeyOrPem string, keyType common.KeyType) *Client {
+	var ed25519Key ed25519.PrivateKey
+	if keyType == common.ED25519_KEY {
+		ed25519Key = common.ParseEd25519PemKey(secretKeyOrPem)
+	}
+
 	return &Client{
 		APIKey:     apiKey,
-		SecretKey:  secretKey,
+		SecretKey:  secretKeyOrPem,
+		KeyType:    keyType,
 		BaseURL:    getApiEndpoint(),
 		UserAgent:  "Binance/golang",
 		HTTPClient: http.DefaultClient,
 		Logger:     log.New(os.Stderr, "Binance-golang ", log.LstdFlags),
+		ed25519Key: ed25519Key,
 	}
 }
 
 // NewProxiedClient passing a proxy url
-func NewProxiedClient(apiKey, secretKey, proxyUrl string) *Client {
+func NewProxiedClient(apiKey, secretKeyOrPem, proxyUrl string, keyType common.KeyType) *Client {
 	proxy, err := url.Parse(proxyUrl)
 	if err != nil {
 		log.Fatal(err)
@@ -225,15 +234,21 @@ func NewProxiedClient(apiKey, secretKey, proxyUrl string) *Client {
 		Proxy:           http.ProxyURL(proxy),
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
+	var ed25519Key ed25519.PrivateKey
+	if keyType == common.ED25519_KEY {
+		ed25519Key = common.ParseEd25519PemKey(secretKeyOrPem)
+	}
 	return &Client{
 		APIKey:    apiKey,
-		SecretKey: secretKey,
+		SecretKey: secretKeyOrPem,
+		KeyType:   keyType,
 		BaseURL:   getApiEndpoint(),
 		UserAgent: "Binance/golang",
 		HTTPClient: &http.Client{
 			Transport: tr,
 		},
-		Logger: log.New(os.Stderr, "Binance-golang ", log.LstdFlags),
+		Logger:     log.New(os.Stderr, "Binance-golang ", log.LstdFlags),
+		ed25519Key: ed25519Key,
 	}
 }
 
@@ -243,6 +258,7 @@ type doFunc func(req *http.Request) (*http.Response, error)
 type Client struct {
 	APIKey     string
 	SecretKey  string
+	KeyType    common.KeyType
 	BaseURL    string
 	UserAgent  string
 	HTTPClient *http.Client
@@ -250,6 +266,7 @@ type Client struct {
 	Logger     *log.Logger
 	TimeOffset int64
 	do         doFunc
+	ed25519Key ed25519.PrivateKey
 }
 
 func (c *Client) debug(format string, v ...interface{}) {
@@ -275,6 +292,7 @@ func (c *Client) parseRequest(r *request, opts ...RequestOption) (err error) {
 	if r.secType == secTypeSigned {
 		r.setParam(timestampKey, currentTimestamp()-c.TimeOffset)
 	}
+	r.query.Del(signatureKey)
 	queryString := r.query.Encode()
 	body := &bytes.Buffer{}
 	bodyString := r.form.Encode()
@@ -292,13 +310,27 @@ func (c *Client) parseRequest(r *request, opts ...RequestOption) (err error) {
 
 	if r.secType == secTypeSigned {
 		raw := fmt.Sprintf("%s%s", queryString, bodyString)
-		mac := hmac.New(sha256.New, []byte(c.SecretKey))
-		_, err = mac.Write([]byte(raw))
-		if err != nil {
-			return err
+		var signature string
+
+		if c.KeyType == common.HMAC_KEY {
+			mac := hmac.New(sha256.New, []byte(c.SecretKey))
+			_, err = mac.Write([]byte(raw))
+			if err != nil {
+				return err
+			}
+			signature = fmt.Sprintf("%x", mac.Sum(nil))
+		} else if c.KeyType == common.ED25519_KEY && c.ed25519Key != nil {
+			signatureBytes, err := c.ed25519Key.Sign(nil, []byte(raw), crypto.Hash(0))
+			if err != nil {
+				return err
+			}
+			signature = fmt.Sprintf("%x", signatureBytes)
+		} else {
+			return fmt.Errorf("unsupported key type")
 		}
+
 		v := url.Values{}
-		v.Set(signatureKey, fmt.Sprintf("%x", (mac.Sum(nil))))
+		v.Set(signatureKey, signature)
 		if queryString == "" {
 			queryString = v.Encode()
 		} else {
